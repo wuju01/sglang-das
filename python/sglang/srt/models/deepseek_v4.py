@@ -124,6 +124,7 @@ from sglang.srt.layers.moe.utils import (
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization import dsv41_channelwise_fp8 as channelwise_fp8
+from sglang.srt.layers.quantization import dsv41_channelwise_int8 as channelwise_int8
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -972,6 +973,7 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
+    wo_a_int8: bool = False
 
     def __init__(
         self,
@@ -1111,6 +1113,11 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
+        self.wo_a_int8 = self.is_dsv41 and channelwise_int8.enabled(
+            self.wo_a, quant_config, add_prefix("wo_a", prefix)
+        )
+        if self.wo_a_int8:
+            channelwise_int8.install(self.wo_a)
         if self.wo_a_channelwise_fp8:
             channelwise_fp8.install(self.wo_a)
         if quantize_wo_a:
@@ -2750,7 +2757,11 @@ class MQALayer(MqaAttentionBase):
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
 
-            if fuse_rope_wo_a:
+            if self.wo_a_int8:
+                o = channelwise_int8.grouped(
+                    o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                )
+            elif fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
                 out = fused_rope_wo_a_bf16(
                     o,
@@ -5084,6 +5095,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "Channelwise FP8 LM head does not support tied embeddings"
                     )
                 channelwise_fp8.install(self.lm_head)
+            if (
+                self.pp_group.is_last_rank
+                and getattr(config, "model_type", None) == "deepseek_v41"
+                and channelwise_int8.enabled(
+                    self.lm_head, quant_config, add_prefix("lm_head", prefix)
+                )
+            ):
+                if config.tie_word_embeddings:
+                    raise ValueError("INT8 LM head does not support tied embeddings")
+                channelwise_int8.install(self.lm_head)
             self.logits_processor = LogitsProcessor(config)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -6424,6 +6445,9 @@ def _dequant_fp8_wo_a_streaming(
 
     for name, tensor in weights:
         if name.endswith(".wo_a.weight"):
+            if tensor.dtype == torch.int8:
+                yield name, tensor
+                continue
             prefix = name[: -len(".weight")]
             bucket = pending.setdefault(prefix, {})
             scale = bucket.pop("scale", None)
